@@ -63,15 +63,51 @@ class NetworkParameters(spy.InstanceList):
         )
 
 
+class LatentTexture(spy.InstanceList):
+    def __init__(self, width: int, height: int, num_latents: int):
+        super().__init__(module[f"LatentTexture<{num_latents}>"])
+
+        # Grid of learned feature vectors, indexed (y, x, latent).
+        self.texture = spy.Tensor.from_numpy(
+            app.device,
+            np.random.uniform(-0.5, 0.5, (height, width, num_latents)).astype("float32"),
+        )
+        self.texture_grads = spy.Tensor.zeros_like(self.texture)
+
+        # Temp data for Adam optimizer.
+        self.m_texture = spy.Tensor.zeros_like(self.texture)
+        self.v_texture = spy.Tensor.zeros_like(self.texture)
+
+    # Calls the Slang 'optimize' function for the latents
+    def optimize(self, learning_rate: float, optimize_counter: int):
+        module.optimizer_step(
+            self.texture,
+            self.texture_grads,
+            self.m_texture,
+            self.v_texture,
+            learning_rate,
+            optimize_counter,
+        )
+
+
+# Must match the constants in the Slang `Network` struct.
+NUM_OCTAVES = 4
+NUM_FREQ_INPUTS = 2 * NUM_OCTAVES * 2
+NUM_LATENTS = 4
+NUM_HIDDEN = 64  # `NumLayers` in the shader
+
+
 class Network(spy.InstanceList):
     def __init__(self):
         super().__init__(module["Network"])
-        self.layer0 = NetworkParameters(2, 32)
-        self.layer1 = NetworkParameters(32, 32)
-        self.layer2 = NetworkParameters(32, 3)
+        self.latent_texture = LatentTexture(64, 64, NUM_LATENTS)
+        self.layer0 = NetworkParameters(NUM_FREQ_INPUTS + NUM_LATENTS, NUM_HIDDEN)
+        self.layer1 = NetworkParameters(NUM_HIDDEN, NUM_HIDDEN)
+        self.layer2 = NetworkParameters(NUM_HIDDEN, 3)
 
-    # Calls the Slang 'optimize' function for the layer.
+    # Calls the Slang 'optimize' function for the latents and each layer.
     def optimize(self, learning_rate: float, optimize_counter: int):
+        self.latent_texture.optimize(learning_rate, optimize_counter)
         self.layer0.optimize(learning_rate, optimize_counter)
         self.layer1.optimize(learning_rate, optimize_counter)
         self.layer2.optimize(learning_rate, optimize_counter)
@@ -110,7 +146,7 @@ while app.process_events():
     learning_rate = 0.001
 
     # NOTE: For faster feedback we use a low number of iterations (20) per frame. This will be more efficient if you turn it up.
-    for i in range(20):
+    for i in range(100):
         module.calculate_grads(
             seed=spy.wang_hash(seed=optimize_counter, warmup=2),
             batch_index=spy.grid(batch_size),

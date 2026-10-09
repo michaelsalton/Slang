@@ -1,6 +1,6 @@
 // A tiny MLP that maps a pixel position (u, v) to an RGB color, trained to reproduce an image.
 //
-//   uv (2) -> frequency encoding (ENCODED) -> 32 -> LeakyReLU -> 32 -> LeakyReLU -> 3 -> sigmoid
+//   uv (2) -> [frequency encoding (16) | latent texture (4)] -> 32 -> LeakyReLU -> 32 -> LeakyReLU -> 3 -> sigmoid
 //
 // All weights and biases live in one flat `DiffTensor` so that Slang's autodiff can push
 // gradients back into it. Each GPU thread evaluates the network for one pixel; in the backward
@@ -28,16 +28,23 @@ struct NetworkParameters<int Inputs, int Outputs>
         return weights.load(neuron, input);
     }
 
+    // Every thread in the batch adds to every weight, so naive atomics serialize badly (enough to
+    // hit the GPU watchdog at 64 neurons). All lanes reach these calls together, so sum across the
+    // wave first and issue one atomic per wave instead of one per thread.
     [BackwardDerivativeOf(get_bias)]
     void get_bias_bwd(int neuron, float grad)
     {
-        biases_grad.add(neuron, grad);
+        float wave_grad = WaveActiveSum(grad);
+        if (WaveIsFirstLane())
+            biases_grad.add(neuron, wave_grad);
     }
 
     [BackwardDerivativeOf(get_weight)]
     void get_weight_bwd(int neuron, int input, float grad)
     {
-        weights_grad.add(neuron, input, grad);
+        float wave_grad = WaveActiveSum(grad);
+        if (WaveIsFirstLane())
+            weights_grad.add(neuron, input, wave_grad);
     }
 
     [Differentiable]
@@ -60,21 +67,73 @@ struct NetworkParameters<int Inputs, int Outputs>
     }
 }
 
+struct LatentTexture<int NumLatents>
+{
+    Tensor<float, 3> texture;
+
+    AtomicTensor<float, 3> texture_grads;
+
+    [BackwardDerivative(get_latent_bwd)]
+    float get_latent(int x, int y, int latent_index)
+    {
+        return texture.load(y, x, latent_index);
+    }
+
+    void get_latent_bwd(int x, int y, int latent_index, float latent_grad)
+    {
+        texture_grads.add(y, x, latent_index, latent_grad);
+    }
+
+    [Differentiable]
+    // uv is taken by value so the caller's uv is left untouched for the frequency encoding
+    float[NumLatents] sample(no_diff float2 uv)
+    {
+        int2 size = { texture.shape[1], texture.shape[0] };
+        // Convert to (fractional) texel position
+        uv *= float2(size - 1);
+        // Get (clamped) integer positions of texel corners
+        int2 c0 = clamp(int2(uv), int2(0), size - 1);
+        int2 c1 = min(c0 + 1, size - 1);
+
+        // Get fractional part of texel position for interpolation
+        uv = saturate(uv - float2(c0));
+
+        float result[NumLatents];
+        [ForceUnroll]
+        for (int i = 0; i < NumLatents; ++i)
+        {
+            // Simple linear interpolation of latent texture
+            float latent00 = get_latent(c0.x, c0.y, i);
+            float latent10 = get_latent(c1.x, c0.y, i);
+            float latent01 = get_latent(c0.x, c1.y, i);
+            float latent11 = get_latent(c1.x, c1.y, i);
+            result[i] = lerp(lerp(latent00, latent10, uv.x), lerp(latent01, latent11, uv.x), uv.y);
+        }
+
+        return result;
+    }
+}
+
 struct Network
 {
+    static const int NumLayers = 64;
     static const int NumOctaves = 4;
-    static const int NumEncodedInputs = 2 * NumOctaves * 2;
+    static const int NumFreqInputs = 2 * NumOctaves * 2;
+    static const int NumLatents = 4;
+    static const int NumInputs = NumFreqInputs + NumLatents;
 
-    NetworkParameters<NumEncodedInputs, 32> layer0;
-    NetworkParameters<32, 32> layer1;
-    NetworkParameters<32, 3> layer2;
+    LatentTexture<NumLatents> latent_texture;
+    NetworkParameters<NumInputs, NumLayers> layer0;
+    NetworkParameters<NumLayers, NumLayers> layer1;
+    NetworkParameters<NumLayers, 3> layer2;
 
     // Evaluate the layer and output activations
     [Differentiable]
     float3 eval(no_diff float2 uv)
     {
+        // Network input = [frequency encoding | latents]
         // for each input (u and v), we get 2 encoded outputs (sine and cosine) per octave
-        float encoded_inputs[2 * NumOctaves * 2];
+        float inputs[NumInputs] = {};
 
         [ForceUnroll]
         for (int octave = 0; octave < NumOctaves; ++octave)
@@ -82,25 +141,31 @@ struct Network
             float scale = 2.0f * float.getPi() * float(1 << octave);
 
             // u encodings
-            encoded_inputs[octave * 4 + 0] = sin(uv[0] * scale);
-            encoded_inputs[octave * 4 + 1] = cos(uv[0] * scale);
+            inputs[octave * 4 + 0] = sin(uv[0] * scale);
+            inputs[octave * 4 + 1] = cos(uv[0] * scale);
 
             // v encodings
-            encoded_inputs[octave * 4 + 2] = sin(uv[1] * scale);
-            encoded_inputs[octave * 4 + 3] = cos(uv[1] * scale);
+            inputs[octave * 4 + 2] = sin(uv[1] * scale);
+            inputs[octave * 4 + 3] = cos(uv[1] * scale);
         }
 
-        float output0[32] = layer0.forward(encoded_inputs);
+        // latent texture -> inputs[NumFreqInputs .. NumInputs)
+        float latents[NumLatents] = latent_texture.sample(uv);
+        [ForceUnroll]
+        for (int i = 0; i < NumLatents; ++i)
+            inputs[NumFreqInputs + i] = latents[i];
+
+        float output0[NumLayers] = layer0.forward(inputs);
 
         // layer 0
         [ForceUnroll]
-        for (int i = 0; i < 32; ++i)
+        for (int i = 0; i < NumLayers; ++i)
             output0[i] = leakyReLU(output0[i]);
-        float output1[32] = layer1.forward(output0);
+        float output1[NumLayers] = layer1.forward(output0);
 
         // layer 1
         [ForceUnroll]
-        for (int i = 0; i < 32; ++i)
+        for (int i = 0; i < NumLayers; ++i)
             output1[i] = leakyReLU(output1[i]);
         float output2[3] = layer2.forward(output1);
 
