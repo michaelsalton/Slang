@@ -18,3 +18,5 @@ outputs/*
 *.metallib
 
 .DS_Store
+
+CLAUDE.md
