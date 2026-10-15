@@ -17,12 +17,14 @@ struct NetworkParameters<int Inputs, int Outputs>
     AtomicTensor<float, 2> weights_grad;
 
     [Differentiable]
+    [PreferRecompute]
     float get_bias(int neuron)
     {
         return biases.load(neuron);
     }
 
     [Differentiable]
+    [PreferRecompute]
     float get_weight(int neuron, int input)
     {
         return weights.load(neuron, input);
@@ -160,13 +162,13 @@ struct Network
         // layer 0
         [ForceUnroll]
         for (int i = 0; i < NumLayers; ++i)
-            output0[i] = leakyReLU(output0[i]);
+            output0[i] = leakySmeLU(output0[i]);
         float output1[NumLayers] = layer1.forward(output0);
 
         // layer 1
         [ForceUnroll]
         for (int i = 0; i < NumLayers; ++i)
-            output1[i] = leakyReLU(output1[i]);
+            output1[i] = leakySmeLU(output1[i]);
         float output2[3] = layer2.forward(output1);
 
         // layer 2
@@ -192,6 +194,23 @@ float leakyReLU(float x, float negativeSlope = 0.01f)
         return x;
     else
         return x * negativeSlope;
+}
+
+[Differentiable]
+float smeLU(float x, float beta = 1.0f)
+{
+    if (x >= beta)
+        return x;
+    if (x <= -beta)
+        return 0.0f;
+    float t = x + beta;
+    return t * t / (4.0 * beta);
+}
+
+[Differentiable]
+float leakySmeLU(float x, float negativeSlope = 0.0f, float beta = 1.0f)
+{
+    return negativeSlope * x + (1.0f - negativeSlope) * smeLU(x, beta);
 }
 
 // "Render" the neural texture
